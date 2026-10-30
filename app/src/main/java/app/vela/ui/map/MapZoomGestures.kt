@@ -29,11 +29,17 @@ import kotlin.math.roundToInt
  *
  * The fingers add to a pending zoom `a`. Each frame the camera takes `sign(a) min(|a|, 10 a^2)` of
  * it ([DRAIN_GAIN]): a large change goes through at once and a small one eases in. After the lift
- * the zoom flings with Android's [Scroller], the deceleration of a list fling on the same phone,
- * at the release speed: the finger's vertical speed for the one-finger zoom, and for a pinch the
- * span's rate when the first finger lifts, projected 1 ms ahead. [FLING_LEVEL_OF_SCREEN] of the
- * screen height counts as one level, at most [FLING_MAX_LEVELS_PER_S] and [FLING_MAX_LEVELS]. While
- * the fling runs the pending zoom is applied in full.
+ * the map flings: one fling for the pan and the zoom together, on the curve of Android's [Scroller],
+ * the deceleration of a list fling on the same phone. MapLibre keeps the drag and its own fling is
+ * off. The zoom's release speed is the finger's vertical speed for the one-finger zoom, and for a
+ * pinch the span's rate when the first finger lifts, projected 1 ms ahead. [FLING_LEVEL_OF_SCREEN]
+ * of the screen height counts as one level, at most [FLING_MAX_LEVELS] in all. The pan's is the
+ * fingers' average velocity, uncapped; with several fingers it is taken when the first one lifts if
+ * the last follows within [LIFT_SNAPSHOT_MS]. A zoom speed over [FLING_MAX_LEVELS_PER_S] scales both
+ * down alike. Each channel travels the distance a Scroller fling of its own speed would, and the
+ * fastest one in pixels drives the shared curve, so both end together. A one-finger zoom does not
+ * pan, and the pan does not fling during a tilt, or after a pinch or a turn while the camera
+ * follows. While the fling runs the pending zoom is applied in full.
  *
  * The camera moves through [MapLibreMap.setZoom], as MapLibre's own gestures move it, so a frame
  * fires no camera idle. When a zoom and its fling end, [Listener.onZoomEnd] runs and then one
@@ -49,6 +55,10 @@ internal class MapZoomGestures(
         fun onZoomBegin()
         fun onZoom()
         fun onZoomEnd()
+        /** The camera follows a position (a drive, or the free-drive follow). */
+        fun following(): Boolean
+        /** The camera move that closes a gesture or its fling is on its way, and is the user's. */
+        fun onSettle()
     }
 
     /** SETTLE: the fingers are up and the pending zoom or the fling is still running. */
@@ -88,14 +98,29 @@ internal class MapZoomGestures(
     private val frame = Choreographer.FrameCallback { step() }
 
     private val velocity = VelocityTracker.obtain()
-    private val scroller = Scroller(view.context)
+    private val driver = Scroller(view.context, null, false) // no flywheel: a new fling never adds to the last
     private val flingPxPerLevel = FLING_LEVEL_OF_SCREEN * view.resources.displayMetrics.heightPixels
     private var flinging = false
-    private var flingLastX = 0
+    private var lastFraction = 0f
+    private var flingPanX = 0f // the fling's whole travel, in screen px and zoom levels
+    private var flingPanY = 0f
+    private var flingZoom = 0.0
+    private var zoomActive = false // onZoomBegin was told and onZoomEnd is owed
     private var pinchFling = 0.0 // levels a second, taken when the pinch's first finger lifts
+
+    // What this touch did, for the pan fling at the last lift.
+    private var panned = false
+    private var pinched = false
+    private var turned = false
+    private var tilted = false
+    private var liftMs = 0L
+    private var snapVx = 0f
+    private var snapVy = 0f
+    private var hasSnap = false
 
     init {
         gestures.standardScaleGestureDetector.isEnabled = false
+        map.uiSettings.isFlingVelocityAnimationEnabled = false
     }
 
     /** Puts MapLibre's own zoom gestures back. */
@@ -104,6 +129,7 @@ internal class MapZoomGestures(
         velocity.recycle()
         mode = Mode.IDLE
         gestures.standardScaleGestureDetector.isEnabled = true
+        map.uiSettings.isFlingVelocityAnimationEnabled = true
         gestures.rotateGestureDetector.isEnabled = true
         gestures.shoveGestureDetector.isEnabled = true
         gestures.multiFingerTapGestureDetector.isEnabled = true
@@ -120,6 +146,8 @@ internal class MapZoomGestures(
                 gestures.shoveGestureDetector.isEnabled = true
                 gestures.multiFingerTapGestureDetector.isEnabled = true
                 owned = false
+                panned = false; pinched = false; turned = false; tilted = false
+                liftMs = 0L; hasSnap = false
                 downMs = ev.eventTime; downX = ev.x; downY = ev.y
                 tapping = true
                 quickArmed = zoomAllowed() &&
@@ -132,9 +160,10 @@ internal class MapZoomGestures(
                 tapping = false
                 quickArmed = false
                 if (owned) {
-                    if (mode == Mode.QUICK) lift(0.0)
+                    if (mode == Mode.QUICK) lift()
                     return true
                 }
+                liftMs = 0L
                 if (mode == Mode.SETTLE) end()
                 if (mode == Mode.PINCH) lastSpan = span(ev, -1) // the span jumps with a new finger
                 else rebase(span(ev, -1))
@@ -142,6 +171,11 @@ internal class MapZoomGestures(
             }
             MotionEvent.ACTION_MOVE -> {
                 if (tapping && hypot(ev.x - downX, ev.y - downY) > touchSlop) tapping = false
+                if (!owned) {
+                    if (gestures.moveGestureDetector.isInProgress) panned = true
+                    if (gestures.rotateGestureDetector.isInProgress) turned = true
+                    if (gestures.shoveGestureDetector.isInProgress) tilted = true
+                }
                 when {
                     owned -> if (mode == Mode.QUICK) quickMove(ev)
                     ev.pointerCount >= 2 -> pinchMove(ev)
@@ -151,26 +185,35 @@ internal class MapZoomGestures(
             }
             MotionEvent.ACTION_POINTER_UP -> {
                 if (owned) return true
+                liftMs = ev.eventTime
+                averageVelocity(ev).let { (vx, vy) -> snapVx = vx; snapVy = vy; hasSnap = true } // the lifting finger counts
                 if (ev.pointerCount - 1 >= 2) {
                     if (mode == Mode.PINCH) lastSpan = span(ev, ev.actionIndex) else rebase(span(ev, ev.actionIndex))
                 } else if (mode == Mode.PINCH) {
                     // Taken at the first lift, so the finger left on the screen adds nothing. The
                     // fling waits for that finger to lift.
                     pinchFling = pinchSpeed(ev)
-                    lift(0.0)
+                    lift()
                 }
                 return false
             }
             MotionEvent.ACTION_UP -> {
                 val took = owned
                 owned = false
+                if (!took && gestures.moveGestureDetector.isInProgress) panned = true // a flick of a few events
+                var zoomSpeed = pinchFling // about the last pinch focal
                 if (mode == Mode.QUICK) {
                     velocity.computeCurrentVelocity(1000)
-                    lift(quickLevelsPerHeight() * velocity.getYVelocity(ev.getPointerId(0)) / view.height)
-                } else {
-                    if (mode == Mode.PINCH) lift(0.0)
-                    if (pinchFling != 0.0) fling(pinchFling) // about the last pinch focal
+                    zoomSpeed = quickLevelsPerHeight() * velocity.getYVelocity(ev.getPointerId(0)) / view.height
+                    focal.set(view.width / 2f, view.height / 2f)
                 }
+                val (panVx, panVy) = if (!took && panned && !tilted && map.uiSettings.isScrollGesturesEnabled &&
+                    !((pinched || turned) && listener.following())
+                ) {
+                    if (hasSnap && ev.eventTime <= liftMs + LIFT_SNAPSHOT_MS) snapVx to snapVy else averageVelocity(ev)
+                } else 0f to 0f
+                if (mode == Mode.QUICK || mode == Mode.PINCH) lift()
+                fling(panVx, panVy, zoomSpeed)
                 pinchFling = 0.0
                 // A single tap arms the one-finger zoom for the next touch. The second tap of a
                 // double tap does not, or a third tap would arm it again.
@@ -185,7 +228,7 @@ internal class MapZoomGestures(
             MotionEvent.ACTION_CANCEL -> {
                 val took = owned
                 owned = false
-                if (mode == Mode.QUICK || mode == Mode.PINCH) lift(0.0)
+                if (mode == Mode.QUICK || mode == Mode.PINCH) lift()
                 pinchFling = 0.0
                 tapUpMs = Long.MIN_VALUE / 2
                 tapping = false
@@ -210,6 +253,7 @@ internal class MapZoomGestures(
             if (map.uiSettings.isTiltGesturesEnabled && abs(s - startSpan) < TILT_GUARD * abs(focal.y - startFocalY)) return
             if (!zoomAllowed() || gestures.shoveGestureDetector.isInProgress) return
             begin(Mode.PINCH)
+            pinched = true
             lastSpan = startSpan
         }
         if (s <= 0f || lastSpan <= 0f) return
@@ -263,6 +307,7 @@ internal class MapZoomGestures(
         ) gestures.rotateGestureDetector.isEnabled = false
         if (!gestures.moveGestureDetector.isInProgress) map.cancelTransitions()
         target = map.zoom
+        zoomActive = true
         listener.onZoomBegin()
     }
 
@@ -272,11 +317,22 @@ internal class MapZoomGestures(
         postFrame()
     }
 
-    /** The fingers are up: finish the pending zoom, flinging at [levelsPerSecond]. */
-    private fun lift(levelsPerSecond: Double) {
+    /** The fingers are up: finish the pending zoom. */
+    private fun lift() {
         mode = Mode.SETTLE
-        fling(levelsPerSecond)
         postFrame()
+    }
+
+    /** The fingers' average velocity in px a second, uncapped. */
+    private fun averageVelocity(ev: MotionEvent): Pair<Float, Float> {
+        velocity.computeCurrentVelocity(1000)
+        var vx = 0f
+        var vy = 0f
+        for (i in 0 until ev.pointerCount) {
+            val id = ev.getPointerId(i)
+            vx += velocity.getXVelocity(id); vy += velocity.getYVelocity(id)
+        }
+        return vx / ev.pointerCount to vy / ev.pointerCount
     }
 
     /** The pinch's zoom speed when its first finger lifts: the span projected 1 ms ahead. */
@@ -293,18 +349,37 @@ internal class MapZoomGestures(
         return if (s0 > 0f && s1 > 0f) ln((s1 / s0).toDouble()) / LN2 * 1000 else 0.0
     }
 
-    private fun fling(levelsPerSecond: Double) {
-        val v = levelsPerSecond.coerceIn(-FLING_MAX_LEVELS_PER_S, FLING_MAX_LEVELS_PER_S)
-        val vPx = (v * flingPxPerLevel).roundToInt()
-        if (vPx == 0) return
-        if (mode == Mode.IDLE) { // a pinch whose pending zoom already finished before the last lift
-            target = map.zoom
+    /** Where a Scroller fling at [v] px a second, held to [min]..[max], comes to rest. */
+    private fun flingDistance(v: Int, min: Int, max: Int): Int =
+        Scroller(view.context, null, false).run { fling(0, 0, v, 0, min, max, 0, 0); finalX }
+
+    /** One fling for the pan ([panVx], [panVy], the fingers' px a second) and the zoom ([zoomSpeed] levels a second). */
+    private fun fling(panVx: Float, panVy: Float, zoomSpeed: Double) {
+        var vx = panVx
+        var vy = panVy
+        var vz = zoomSpeed
+        if (abs(vz) > FLING_MAX_LEVELS_PER_S) {
+            val k = FLING_MAX_LEVELS_PER_S / abs(vz)
+            vx *= k.toFloat(); vy *= k.toFloat(); vz *= k
+        }
+        val panSpeed = hypot(vx, vy).roundToInt()
+        val zoomPx = (vz * flingPxPerLevel).roundToInt()
+        if (panSpeed == 0 && zoomPx == 0) return
+        val zoomMax = (FLING_MAX_LEVELS * flingPxPerLevel).toInt()
+        val panTravel = if (panSpeed == 0) 0 else flingDistance(panSpeed, Int.MIN_VALUE, Int.MAX_VALUE)
+        flingPanX = if (panSpeed == 0) 0f else panTravel * vx / panSpeed
+        flingPanY = if (panSpeed == 0) 0f else panTravel * vy / panSpeed
+        flingZoom = if (zoomPx == 0) 0.0 else flingDistance(zoomPx, -zoomMax, zoomMax) / flingPxPerLevel.toDouble()
+        if (mode == Mode.IDLE) target = map.zoom
+        if (flingZoom != 0.0 && !zoomActive) { // a pinch whose pending zoom finished before the last lift
+            zoomActive = true
             listener.onZoomBegin()
         }
         mode = Mode.SETTLE
-        val maxPx = (FLING_MAX_LEVELS * flingPxPerLevel).toInt()
-        scroller.fling(0, 0, vPx, 0, -maxPx, maxPx, 0, 0)
-        flingLastX = 0
+        driver.forceFinished(true)
+        if (panSpeed >= abs(zoomPx)) driver.fling(0, 0, panSpeed, 0, Int.MIN_VALUE, Int.MAX_VALUE, 0, 0)
+        else driver.fling(0, 0, abs(zoomPx), 0, 0, zoomMax, 0, 0)
+        lastFraction = 0f
         flinging = true
         postFrame()
     }
@@ -316,7 +391,7 @@ internal class MapZoomGestures(
     }
 
     private fun stopFrames() {
-        if (flinging) { scroller.forceFinished(true); flinging = false }
+        if (flinging) { driver.forceFinished(true); flinging = false }
         Choreographer.getInstance().removeFrameCallback(frame)
         framePosted = false
     }
@@ -326,9 +401,12 @@ internal class MapZoomGestures(
         framePosted = false
         if (mode == Mode.IDLE) return
         if (flinging) {
-            if (scroller.computeScrollOffset()) {
-                target = (target + (scroller.currX - flingLastX) / flingPxPerLevel).coerceIn(map.minZoomLevel, map.maxZoomLevel)
-                flingLastX = scroller.currX
+            if (driver.computeScrollOffset()) {
+                val fraction = if (driver.finalX == 0) 1f else driver.currX.toFloat() / driver.finalX
+                val d = fraction - lastFraction
+                lastFraction = fraction
+                if (flingPanX != 0f || flingPanY != 0f) map.scrollBy(flingPanX * d, flingPanY * d)
+                if (flingZoom != 0.0) target = (target + flingZoom * d).coerceIn(map.minZoomLevel, map.maxZoomLevel)
             } else flinging = false
         }
         val z = map.zoom
@@ -353,7 +431,8 @@ internal class MapZoomGestures(
         stopFrames()
         mode = Mode.IDLE
         gestures.rotateGestureDetector.isEnabled = true
-        listener.onZoomEnd()
+        if (zoomActive) { zoomActive = false; listener.onZoomEnd() }
+        listener.onSettle()
         runCatching { map.moveCamera(CameraUpdateFactory.zoomBy(SETTLE_ZOOM)) }
     }
 
@@ -396,6 +475,8 @@ internal class MapZoomGestures(
         const val FLING_LEVEL_OF_SCREEN = 0.125f
         const val FLING_MAX_LEVELS_PER_S = 15.0
         const val FLING_MAX_LEVELS = 4
+        /** A several-finger release takes the velocity from the first lift when the last follows within this. */
+        const val LIFT_SNAPSHOT_MS = 100L
         /** Span change over the fingers' vertical travel below which a two-finger move is a tilt. */
         const val TILT_GUARD = 0.5f
         /** Small enough not to show, large enough that MapLibre does not drop it as no change. */

@@ -1832,13 +1832,21 @@ raw fix. The per-frame loop (the nav ticker) is in `ui/map/VelaMapView.kt`.
 - The fingers add to a pending zoom `a`. Each frame the camera takes `sign(a) min(|a|, 10 a^2)`
   (`DRAIN_GAIN`), and all of it under `SNAP_LEVELS` (0.002): a large change goes through at once,
   a small one eases in.
-- After the lift the zoom flings with Android's `Scroller`, the deceleration of a list fling on the
-  same phone. The one-finger zoom flings at 4 x the finger's vertical speed / map height levels a
+- After the lift the map flings with Android's `Scroller`, the deceleration of a list fling on the
+  same phone: one fling for the pan and the zoom together. MapLibre keeps the drag
+  (`isFlingVelocityAnimationEnabled` off, so its own fling does not run). The pan flings at the
+  fingers' average velocity, uncapped and with no distance limit; with several fingers the
+  velocity is taken when the first one lifts if the last follows within `LIFT_SNAPSHOT_MS`
+  (100 ms). It does not fling during a tilt, after a pinch or a turn while the camera follows
+  (`Listener.following`), or after a one-finger zoom. Each channel travels what a `Scroller`
+  fling of its own speed would, and the fastest in pixels drives the shared curve, so both end
+  together. A zoom speed over `FLING_MAX_LEVELS_PER_S` scales the pan down by the same factor. The one-finger zoom flings at 4 x the finger's vertical speed / map height levels a
   second, from `VelocityTracker`. A pinch flings at the span's rate projected 1 ms ahead, taken
   when its first finger lifts so the finger left on the screen adds nothing, and starts when the
   last one lifts, about the last focal point. `FLING_LEVEL_OF_SCREEN` (1/8 of the screen height)
   is one level, at most `FLING_MAX_LEVELS_PER_S` (15) and `FLING_MAX_LEVELS` (4). While it runs the
-  pending zoom is applied in full. A touch stops it. A finger that stopped before the lift has no
+  pending zoom is applied in full. A touch stops it, and a new fling never adds to the last one's
+  speed. A finger that stopped before the lift has no
   speed and does not fling. On a 1,080 x 2,340 px phone at 480 dpi a 300 px one-finger flick in
   80 ms zooms 1.27 levels, 0.86 of them after the lift; Google Maps on the same phone ends the same
   flick at about 1.2 by video, which reads a few percent low. Dials: `pinchStartInch`,

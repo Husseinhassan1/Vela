@@ -1310,9 +1310,10 @@ fun VelaMapView(
                         zoomOverride.value(true)
                     }
                     scaling[0] = false
-                    zoomSettling[0] = true
                     map.gesturesManager.rotateGestureDetector.angleThreshold = TURN_START_DEG
                 }
+                override fun following() = (navModeHolder.value && navFollowingHolder.value) || driveFollowingHolder.value
+                override fun onSettle() { zoomSettling[0] = true }
             })
             mapView.setOnTouchListener { _, ev ->
                 val dots = drawDotsHolder.value
